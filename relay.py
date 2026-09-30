@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from io import BytesIO
@@ -48,6 +49,7 @@ def get_reply_source_id(message: Any) -> int | None:
     reply_to_chat = getattr(message, "reply_to_chat", None)
     if reply_to_chat is not None:
         return None
+
     return int(reply_id)
 
 
@@ -65,7 +67,12 @@ async def send_allowed_message(
         # يعيد البوت رفعها من جلسته هو. هذا يتجنب الاعتماد على صلاحية كائن
         # الوسائط بين جلستين مختلفتين.
         buffer = BytesIO()
-        downloaded = await user_client.download_media(message, file=buffer)
+
+        downloaded = await user_client.download_media(
+            message,
+            file=buffer,
+        )
+
         if downloaded is None:
             raise RuntimeError("Failed to download source photo")
 
@@ -94,16 +101,31 @@ async def send_allowed_message(
     )
 
 
-async def run_once(user_client: TelegramClient, bot_client: TelegramClient, state: StateManager) -> dict[str, int]:
+async def run_once(
+    user_client: TelegramClient,
+    bot_client: TelegramClient,
+    state: StateManager,
+) -> dict[str, int]:
+
     source_entity = await user_client.get_entity(SOURCE_CHANNEL)
     target_entity = await bot_client.get_entity(TARGET_CHANNEL)
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=LOOKBACK_MINUTES)
 
-    # get_messages يعيد الأحدث أولاً عادةً. نرتب لاحقاً من الأقدم إلى الأحدث.
-    messages = await user_client.get_messages(source_entity, limit=MAX_MESSAGES)
-    candidates = [m for m in messages if m and m.date and m.date >= cutoff]
+    # get_messages يعيد الأحدث أولاً عادةً.
+    # نرتب لاحقاً من الأقدم إلى الأحدث حتى يتم النشر بالترتيب الصحيح.
+    messages = await user_client.get_messages(
+        source_entity,
+        limit=MAX_MESSAGES,
+    )
+
+    candidates = [
+        m
+        for m in messages
+        if m and m.date and m.date >= cutoff
+    ]
+
     candidates.sort(key=lambda m: m.date)
 
     stats: dict[str, int] = {
@@ -115,31 +137,56 @@ async def run_once(user_client: TelegramClient, bot_client: TelegramClient, stat
     }
 
     for message in candidates:
+
+        # منع تكرار نفس رسالة المصدر.
         if state.has_source_message(message.id):
             stats["duplicates"] += 1
             continue
 
+        # منع تكرار نفس المحتوى حتى لو كان رقم الرسالة مختلفاً.
         fingerprint = message_fingerprint(message)
+
         if state.has_fingerprint(fingerprint):
-            state.remember(message.id, 0, fingerprint)
+            state.remember(
+                message.id,
+                0,
+                fingerprint,
+            )
             state.save()
+
             stats["duplicates"] += 1
             continue
 
+        # تطبيق جميع شروط الفلترة.
         result = evaluate(message)
+
         if not result.allowed:
             stats["skipped"] += 1
-            logger.info("SKIP source=%s reason=%s", message.id, result.reason)
+
+            logger.info(
+                "SKIP source=%s reason=%s",
+                message.id,
+                result.reason,
+            )
+
             continue
 
+        # معرفة الرسالة الأصلية التي يرد عليها الخبر.
         reply_source_id = get_reply_source_id(message)
-        reply_target_id = state.get_target_message_id(reply_source_id) if reply_source_id else None
 
-        # 0 يمكن أن يظهر في الحالة فقط للفهرسة، لذلك لا نستخدمه كـ reply.
+        reply_target_id = (
+            state.get_target_message_id(reply_source_id)
+            if reply_source_id
+            else None
+        )
+
+        # 0 يستخدم داخل الحالة للفهرسة فقط،
+        # ولا يمكن استخدامه كـ reply.
         if reply_target_id == 0:
             reply_target_id = None
 
         try:
+            # نشر الرسالة بواسطة البوت.
             sent = await send_allowed_message(
                 user_client,
                 bot_client,
@@ -147,18 +194,38 @@ async def run_once(user_client: TelegramClient, bot_client: TelegramClient, stat
                 message,
                 reply_to_target_id=reply_target_id,
             )
-            state.remember(message.id, sent.id, fingerprint)
+
+            # حفظ الرسالة مباشرة بعد نجاح النشر.
+            state.remember(
+                message.id,
+                sent.id,
+                fingerprint,
+            )
             state.save()
+
             stats["sent"] += 1
+
             logger.info(
                 "SENT source=%s target=%s reply_to=%s",
                 message.id,
                 sent.id,
                 reply_target_id,
             )
+
+            # ========================================================
+            # فاصل ثانيتين بين نشر كل رسالة والتي تليها.
+            # لا يتم الانتظار عند الرسائل المرفوضة أو المكررة.
+            # ========================================================
+            await asyncio.sleep(2)
+
         except Exception:
             stats["errors"] += 1
-            logger.exception("SEND ERROR source=%s", message.id)
+
+            logger.exception(
+                "SEND ERROR source=%s",
+                message.id,
+            )
 
     state.save()
+
     return stats
